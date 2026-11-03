@@ -34,32 +34,72 @@ MOTIFS_URL = ["bookys.me", "www.bookys.me", "bookys.net", "www.bookys.net", "boo
 TOUS_MOTIFS = MOTIFS_TEXTE + MOTIFS_URL
 _JETON_RE = rb"(?<![A-Za-z0-9_.+-])re(?![A-Za-z0-9_.+-])"
 
-def purger_kioskfifi_mark(doc) -> int:
-    """Module de neutralisation chirurgicale du filigrane KioskFifiMark (FCK HMS)."""
-    purgé_global = False
-    compteur_pages = 0
-    try:
-        doc.update_stream(4458, b"")
-        purgé_global = True
-    except Exception:
-        pass
+# Marqueurs connus du filigrane "FCK HMS" (Kiosk/Fifi). Le nom de la balise de
+# marked-content a évolué au fil des versions : on reconnait toute variante
+# /KioskFifi* (ex. ancien "/KioskFifiMark Do" ou nouveau "/KioskFifiLogo BMC ... EMC").
+_FIFI_TAG_RE = rb"Kiosk[Ff]ifi\w*"
 
-    for page_num in range(len(doc)):
-        page = doc[page_num]
-        contents = page.get_contents()
-        page_modifiée = False
-        for content_xref in contents:
+def _balance_q(s: bytes) -> bool:
+    """Vérifie l'équilibre des opérateurs q/Q (sauvegarde/restauration d'état)."""
+    profondeur = 0
+    for m in re.finditer(rb"(?<![A-Za-z0-9_./])(q|Q)(?![A-Za-z0-9_./])", s):
+        profondeur += 1 if m.group(1) == b"q" else -1
+        if profondeur < 0:
+            return False
+    return profondeur == 0
+
+def purger_kioskfifi_mark(doc) -> int:
+    """Module de neutralisation chirurgicale du filigrane KioskFifi (FCK HMS).
+
+    Nouvelle architecture (2026) : le filigrane est un bloc de marked-content
+        /KioskFifiLogo BMC  q  <cm>  /Xnn Do  Q  EMC
+    présent deux fois par page (coins opposés). On supprime le bloc complet
+    (BMC...EMC, opérateurs q/Q inclus) — le contenu originel (texte/images)
+    n'est pas touché. La compatibilité avec l'ancien format
+    "/KioskFifiMark Do" est conservée.
+    """
+    bloc_re = re.compile(rb"/(" + _FIFI_TAG_RE + rb")\s+BMC\b.*?\bEMC", re.S)
+    do_re = re.compile(rb"/(" + _FIFI_TAG_RE + rb")\s+Do")
+    nb_blocs = 0
+    pages_touchees = set()
+
+    # Balayage de tous les flux (streams) du document : content streams des
+    # pages ET XObjects éventuels — bien plus robuste que le codage en dur
+    # d'un xref (l'ancien « update_stream(4458) » ne correspond plus à rien).
+    for x in range(1, doc.xref_length()):
+        if not doc.xref_is_stream(x):
+            continue
+        try:
+            stream = doc.xref_stream(x)
+        except Exception:
+            continue
+        if b"Fifi" not in stream:
+            continue
+        nouveau, n_blocs = bloc_re.subn(b"", stream)
+        nouveau, n_do = do_re.subn(b"", nouveau)
+        n = n_blocs + n_do
+        if n and nouveau != stream:
+            # Garde-fou : ne jamais écrire un flux dont l'équilibre q/Q serait
+            # rompu (le bloc BMC...EMC contient son propre q...Q, mais on
+            # vérifie au cas où le schéma changerait encore).
+            if not _balance_q(nouveau) and _balance_q(stream):
+                continue
             try:
-                stream = doc.xref_stream(content_xref)
-                if b"KioskFifiMark" in stream:
-                    stream = stream.replace(b"/KioskFifiMark Do", b"                 ")
-                    doc.update_stream(content_xref, stream)
-                    page_modifiée = True
+                doc.update_stream(x, nouveau)
+                nb_blocs += n
             except Exception:
                 continue
-        if page_modifiée:
-            compteur_pages += 1
-    return compteur_pages if compteur_pages > 0 else (len(doc) if purgé_global else 0)
+
+    if nb_blocs:
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            for content_xref in page.get_contents():
+                try:
+                    if b"Fifi" in doc.xref_stream_raw(content_xref):
+                        pages_touchees.add(page_num)
+                except Exception:
+                    continue
+    return len(pages_touchees) if pages_touchees else (len(doc) if nb_blocs else 0)
 
 def motif_interdit(url: str) -> bool:
     if not url: return False
@@ -217,9 +257,19 @@ def nettoyer_page_bookys(page) -> int:
         except Exception: pass
     return nb_suppr
 
-def nettoyer_pdf(chemin: str) -> bool:
+def nettoyer_pdf(chemin: str, dossier_sortie: Optional[str] = None) -> bool:
     nom = os.path.basename(chemin)
-    sortie = os.path.join(DOSSIER_SORTIE, nom)
+    if dossier_sortie is None:
+        dossier_sortie = DOSSIER_SORTIE
+        # Si le PDF à traiter se trouve déjà dans le dossier de sortie, on écrit
+        # à côté avec le suffixe « _purge » pour éviter d'écraser l'original.
+        if os.path.dirname(os.path.abspath(chemin)) == os.path.abspath(dossier_sortie):
+            base, ext = os.path.splitext(nom)
+            return _nettoyer_pdf(chemin, os.path.join(dossier_sortie, f"{base}_purge{ext}"))
+    return _nettoyer_pdf(chemin, os.path.join(dossier_sortie, nom))
+
+def _nettoyer_pdf(chemin: str, sortie: str) -> bool:
+    nom = os.path.basename(chemin)
     try: doc = fitz.open(chemin)
     except Exception as e:
         print(f"  [ERREUR] Impossible d'ouvrir '{nom}' : {e}")
@@ -251,6 +301,27 @@ def nettoyer_pdf(chemin: str) -> bool:
     return True
 
 def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+
+    # Mode « fichiers explicites » : python3 purge_bookys.py fichier1.pdf [dossier_sortie]
+    if args and (args[0].lower().endswith(".pdf") or os.path.isdir(args[0])):
+        fichiers = [a for a in args if os.path.isfile(a) and a.lower().endswith(".pdf")]
+        dossier_out = next((a for a in args if os.path.isdir(a)), None) or DOSSIER_SORTIE
+        if not fichiers:
+            print("[ERREUR] Aucun fichier PDF valide passé en argument.")
+            sys.exit(1)
+        os.makedirs(dossier_out, exist_ok=True)
+        print(f"{len(fichiers)} fichier(s) PDF à traiter -> {dossier_out}\n")
+        succes = 0
+        for idx, chemin in enumerate(fichiers, start=1):
+            print(f"[{idx}/{len(fichiers)}] Nettoyage de : {os.path.basename(chemin)}")
+            if _nettoyer_pdf(chemin, os.path.join(dossier_out, os.path.basename(chemin))):
+                succes += 1
+        print("-" * 60)
+        print(f"TERMINÉ : {succes} PDF traité(s) avec succès.")
+        sys.exit(0 if succes == len(fichiers) else 2)
+
+    # Mode historique : traitement du dossier « magazines »
     print("=" * 60)
     print(" PURGE UNIFIÉE DES FILIGRANES MULTI-SOURCES — macOS")
     print("=" * 60)
