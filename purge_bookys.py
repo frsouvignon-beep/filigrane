@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# ============================================================================
+#  PURGE BOOKYS / FILIGRANES FCK HMS  —  v4.2.0 (2026-11-05)
+#  Historique des versions :
+#    v4.2.0  Numéro de version affiché en-tête CLI + option --version ;
+#            gestion des cibles multiples pour le traitement de masse.
+#    v4.1.0  Module FiligraneCoin : suppression des filigranes FCK HMS
+#            vectoriels et raster en haut-gauche / bas-droite de chaque page.
+#    v4.0.0  Traitement de masse (fichiers, dossiers récursifs, globs, -o).
+#    v3.x    Modules Bookys texte/URL, FormFantôme, KioskVectorManifest.
+# ============================================================================
 from __future__ import annotations
 
 import os
@@ -8,10 +18,21 @@ import sys
 import glob
 from typing import List, Optional, Tuple
 
+VERSION = "4.2.0"
+DATE_VERSION = "2026-11-05"
+NOM_SCRIPT = "PURGE BOOKYS / FILIGRANES FCK HMS"
+
+def _banniere():
+    """Affiche l'en-tête avec le numéro de version du script."""
+    entete = f" {NOM_SCRIPT} — v{VERSION} ({DATE_VERSION}) "
+    print("=" * 60)
+    print(entete.center(60))
+    print("=" * 60)
+
 try:
     import fitz  # bibliothèque PyMuPDF
 except ImportError:
-    print("[ERREUR] La bibliothèque 'PyMuPDF' est introuvable.")
+    print(f"[ERREUR] La bibliothèque 'PyMuPDF' est introuvable. (script v{VERSION})")
     sys.exit(1)
 
 DOSSIER_RACINE = "/Users/francoissouvignon/Desktop/generateur_bbcode"
@@ -583,6 +604,7 @@ def _usage(code: int = 1):
     print("                    ou motifs glob ('dossier/*.pdf'). Sans argument : mode macOS")
     print("                    (~/Desktop/generateur_bbcode/magazines -> ~/Downloads).")
     print("  -o DOSSIER_SORTIE dossier de destination (défaut : ~/Downloads).")
+    print("  --version         affiche la version du script.")
     print("EXEMPLES :")
     print("  python3 purge_bookys.py magazine1.pdf magazine2.pdf -o /tmp/propre")
     print("  python3 purge_bookys.py ~/Desktop/generateur_bbcode/magazines -o ~/Desktop/propres")
@@ -597,6 +619,8 @@ def main():
     while i < len(argv):
         a = argv[i]
         if a in ("-h", "--help"): _usage(0)
+        elif a in ("-v", "--version"):
+            print(f"{NOM_SCRIPT} — v{VERSION} ({DATE_VERSION})"); sys.exit(0)
         elif a in ("-o", "--out", "--output"):
             if i + 1 >= len(argv):
                 print("[ERREUR] L'option '%s' exige un dossier de sortie." % a); _usage(1)
@@ -621,9 +645,9 @@ def main():
             _usage(1)
         dossier_out = os.path.abspath(dossier_out) if dossier_out else DOSSIER_SORTIE
         os.makedirs(dossier_out, exist_ok=True)
-        print("=" * 60)
+        _banniere()
         print(f" TRAITEMENT DE MASSE : {len(fichiers)} fichier(s) PDF -> {dossier_out}")
-        print("=" * 60)
+        print("-" * 60)
         succes = echecs = 0
         for idx, chemin in enumerate(fichiers, start=1):
             print(f"[{idx}/{len(fichiers)}] {os.path.basename(chemin)}")
@@ -637,9 +661,9 @@ def main():
         print(f"TERMINÉ : {succes} réussi(s), {echecs} échec(s).")
         sys.exit(0 if echecs == 0 else 2)
 
-    print("=" * 60)
+    _banniere()
     print(" PURGE UNIFIÉE DES FILIGRANES MULTI-SOURCES — macOS")
-    print("=" * 60)
+    print("-" * 60)
     if not os.path.isdir(DOSSIER_MAGAZINES):
         print(f"[ERREUR] Le dossier 'magazines' est introuvable.")
         sys.exit(1)
