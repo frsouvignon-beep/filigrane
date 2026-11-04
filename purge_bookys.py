@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# ============================================================================
+#  PURGE BOOKYS / FILIGRANES FCK HMS  —  v4.2.0 (2026-11-05)
+#  Historique des versions :
+#    v4.2.0  Numéro de version affiché en-tête CLI + option --version ;
+#            gestion des cibles multiples pour le traitement de masse.
+#    v4.1.0  Module FiligraneCoin : suppression des filigranes FCK HMS
+#            vectoriels et raster en haut-gauche / bas-droite de chaque page.
+#    v4.0.0  Traitement de masse (fichiers, dossiers récursifs, globs, -o).
+#    v3.x    Modules Bookys texte/URL, FormFantôme, KioskVectorManifest.
+# ============================================================================
 from __future__ import annotations
 
 import os
@@ -8,10 +18,21 @@ import sys
 import glob
 from typing import List, Optional, Tuple
 
+VERSION = "4.2.0"
+DATE_VERSION = "2026-11-05"
+NOM_SCRIPT = "PURGE BOOKYS / FILIGRANES FCK HMS"
+
+def _banniere():
+    """Affiche l'en-tête avec le numéro de version du script."""
+    entete = f" {NOM_SCRIPT} — v{VERSION} ({DATE_VERSION}) "
+    print("=" * 60)
+    print(entete.center(60))
+    print("=" * 60)
+
 try:
     import fitz  # bibliothèque PyMuPDF
 except ImportError:
-    print("[ERREUR] La bibliothèque 'PyMuPDF' est introuvable.")
+    print(f"[ERREUR] La bibliothèque 'PyMuPDF' est introuvable. (script v{VERSION})")
     sys.exit(1)
 
 DOSSIER_RACINE = "/Users/francoissouvignon/Desktop/generateur_bbcode"
@@ -277,6 +298,68 @@ def purger_form_fantome(doc) -> int:
         for nom in noms_a_retirer: total += _retirer_dessin_xobject(doc, page, nom)
     return total
 
+_H_GRAND_RE = rb"(?:10\d\d|9\d\d|[5-8]\d\d)"  # translation verticale >= ~500 pt (repere les forms pleine page)
+
+def _infos_shading_form(doc, xref: int) -> Tuple[bool, bool]:
+    """Analyse les Shading CMJN references par un XObject Form.
+    Retourne (sombre_fort, voile_faible) :
+      - sombre_fort : un C0 CMJN a une composante >= 0.25 (voile noir/gris marque) ;
+      - voile_faible : un C0 CMJN non nul mais <= 0.25 (bandeau gris tres clair)."""
+    sombre_fort = voile_faible = False
+    try: res = doc.xref_get_key(xref, "Resources")[1] or ""
+    except Exception: return False, False
+    for nom, cible in re.findall(r"/(Sh\d+)\s+(\d+)\s+0\s+R", res):
+        try: obj = doc.xref_object(int(cible), compressed=True)
+        except Exception: continue
+        mc = re.search(r"C0\s*\[([^\]]*)\]", obj)
+        if not mc: continue
+        comps = [float(v) for v in re.findall(rb"[-+]?\d*\.?\d+", mc.group(1).encode())]
+        if len(comps) == 3: comps = [0.0] + comps  # 'C0[0 0 0 .6]' : le 0 colle au '[' et disparait du findall
+        if len(comps) != 4: continue               # hors DeviceCMYK
+        m = max(comps)
+        if m >= 0.25: sombre_fort = True
+        elif m > 0.0: voile_faible = True
+    return sombre_fort, voile_faible
+
+def est_form_voile(doc, xref: int) -> bool:
+    """Vrai si le xref est un XObject Form de type filigrane 'FCK HMS' moderne :
+    invoque un shading (/Sh.. sh) dans un repere pleine page (cm 1 0 0 -1 0 H), avec
+    soit un voile CMJN sombre sans texte, soit un bandeau gris clair accompagnant du
+    contenu vectoriel publicitaire (pub injectee par le distributeur)."""
+    try:
+        if doc.xref_get_key(xref, "Subtype")[1] != "/Form": return False
+        st = doc.xref_stream(xref)
+    except Exception: return False
+    if not re.search(rb"/Sh\d+\s+sh", st): return False
+    if not re.search(rb"1\s+0\s+0\s+-1\s+0\s+" + _H_GRAND_RE, st): return False
+    sombre_fort, voile_faible = _infos_shading_form(doc, xref)
+    a_texte = b"BT" in st
+    return (sombre_fort and not a_texte) or (voile_faible and a_texte)
+
+def detecter_forms_degrade(doc) -> set:
+    """Detecte tous les filigranes vectoriels a base de degrade CMJN (module FormDégradé).
+    Audit complet des XObject Form du document (y compris ceux non listes en tete de page)."""
+    voiles = set()
+    for x in range(1, doc.xref_length()):
+        if est_form_voile(doc, x): voiles.add(x)
+    return voiles
+
+def purger_form_degrade(doc) -> int:
+    """Retire les appels Do des forms-filigranes a degrade CMJN sans toucher aux autres ressources."""
+    voiles = detecter_forms_degrade(doc)
+    if not voiles: return 0
+    total = 0
+    for page in doc:
+        try: xos = page.get_xobjects()
+        except Exception: continue
+        noms_a_retirer = []
+        for entree in xos:
+            try: xref, nom = entree[0], entree[1]
+            except Exception: continue
+            if xref in voiles: noms_a_retirer.append(nom)
+        for nom in dict.fromkeys(noms_a_retirer): total += _retirer_dessin_xobject(doc, page, nom)
+    return total
+
 def purger_traces_kiosk(doc) -> int:
     nb = 0
     cat = doc.pdf_catalog()
@@ -483,6 +566,8 @@ def _nettoyer_pdf(chemin: str, sortie: str) -> bool:
     if purgé_fifi > 0: print(f"    - Module KioskFifiMark (historique) : {purgé_fifi} bloc(s) neutralisé(s).")
     fantomes_neutres = purger_form_fantome(doc)
     if fantomes_neutres > 0: print(f"    - Module FormFantôme : {fantomes_neutres} filigrane(s) FCK HMS neutralisé(s).")
+    degrads_neutres = purger_form_degrade(doc)
+    if degrads_neutres > 0: print(f"    - Module FormDégradé : {degrads_neutres} filigrane(s) vectoriel(s) à dégradé CMJN neutralisé(s).")
     traces_doc = purger_traces_kiosk(doc)
     if traces_doc > 0: print(f"    - Module TracesKiosk : {traces_doc} trace(s) documentaire(s) purgée(s).")
 
@@ -491,7 +576,7 @@ def _nettoyer_pdf(chemin: str, sortie: str) -> bool:
         try: total_bookys += nettoyer_page_bookys(page)
         except Exception: continue
     if total_bookys > 0: print(f"    - Module Bookys : {total_bookys} élément(s) d'arrière-plan purgé(s).")
-    if purgé_fifi == 0 and total_bookys == 0 and fantomes_neutres == 0 and traces_doc == 0:
+    if purgé_fifi == 0 and total_bookys == 0 and fantomes_neutres == 0 and degrads_neutres == 0 and traces_doc == 0:
         print(f"  [OK]     '{nom}' : aucun filigrane connu détecté (copie propre).")
 
     try: doc.save(sortie, garbage=4, deflate=True, clean=True)
@@ -500,23 +585,85 @@ def _nettoyer_pdf(chemin: str, sortie: str) -> bool:
     print(f"  [SAUVEGARDE] -> {sortie}")
     return True
 
-def main():
-    args = [a for a in sys.argv[1:] if not a.startswith("-")]
-    if args and (args[0].lower().endswith(".pdf") or os.path.isdir(args[0])):
-        fichiers = [a for a in args if os.path.isfile(a) and a.lower().endswith(".pdf")]
-        dossier_out = next((a for a in args if os.path.isdir(a)), None) or DOSSIER_SORTIE
-        if not fichiers:
-            print("[ERREUR] Aucun fichier PDF valide passé en argument.")
-            sys.exit(1)
-        os.makedirs(dossier_out, exist_ok=True)
-        succes = 0
-        for idx, chemin in enumerate(fichiers, start=1):
-            if _nettoyer_pdf(chemin, os.path.join(dossier_out, os.path.basename(chemin))): succes += 1
-        sys.exit(0 if succes == len(fichiers) else 2)
+def _collecter_pdfs_chemin(chemin: str) -> List[str]:
+    """Collecte les PDF d'un fichier unique, d'un dossier (récursif) ou d'un motif glob."""
+    if os.path.isfile(chemin) and chemin.lower().endswith(".pdf"):
+        return [chemin]
+    if os.path.isdir(chemin):
+        trouve = set()
+        for motif in ("**/*.pdf", "**/*.PDF"):
+            trouve.update(glob.glob(os.path.join(chemin, motif), recursive=True))
+        return sorted(f for f in trouve if os.path.isfile(f))
+    if any(c in chemin for c in "*?["):
+        return sorted(f for f in glob.glob(chemin) if os.path.isfile(f) and f.lower().endswith(".pdf"))
+    return []
 
-    print("=" * 60)
+def _usage(code: int = 1):
+    print("USAGE : python3 purge_bookys.py [CIBLE...] [-o DOSSIER_SORTIE]")
+    print("  CIBLE             un ou plusieurs fichiers .pdf, dossiers (traitement récursif),")
+    print("                    ou motifs glob ('dossier/*.pdf'). Sans argument : mode macOS")
+    print("                    (~/Desktop/generateur_bbcode/magazines -> ~/Downloads).")
+    print("  -o DOSSIER_SORTIE dossier de destination (défaut : ~/Downloads).")
+    print("  --version         affiche la version du script.")
+    print("EXEMPLES :")
+    print("  python3 purge_bookys.py magazine1.pdf magazine2.pdf -o /tmp/propre")
+    print("  python3 purge_bookys.py ~/Desktop/generateur_bbcode/magazines -o ~/Desktop/propres")
+    sys.exit(code)
+
+def main():
+    argv = sys.argv[1:]
+    # options ponctuelles : -o SORTIE  et  --help
+    dossier_out = None
+    cibles = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-h", "--help"): _usage(0)
+        elif a in ("-v", "--version"):
+            print(f"{NOM_SCRIPT} — v{VERSION} ({DATE_VERSION})"); sys.exit(0)
+        elif a in ("-o", "--out", "--output"):
+            if i + 1 >= len(argv):
+                print("[ERREUR] L'option '%s' exige un dossier de sortie." % a); _usage(1)
+            dossier_out = argv[i + 1]; i += 2
+        elif a.startswith("--out="):
+            dossier_out = a.split("=", 1)[1]; i += 1
+        elif a.startswith("-"):
+            print(f"[ERREUR] Option inconnue : {a}"); _usage(1)
+        else:
+            cibles.append(a); i += 1
+
+    if cibles:
+        fichiers = []
+        for c in cibles:
+            got = _collecter_pdfs_chemin(c)
+            if not got and os.path.exists(c):
+                print(f"[AVERTISSEMENT] '{c}' ignoré (non-PDF ou introuvable).")
+            fichiers.extend(got)
+        fichiers = list(dict.fromkeys(os.path.abspath(f) for f in fichiers))
+        if not fichiers:
+            print("[ERREUR] Aucun fichier PDF valide trouvé dans la/les cible(s) passée(s).")
+            _usage(1)
+        dossier_out = os.path.abspath(dossier_out) if dossier_out else DOSSIER_SORTIE
+        os.makedirs(dossier_out, exist_ok=True)
+        _banniere()
+        print(f" TRAITEMENT DE MASSE : {len(fichiers)} fichier(s) PDF -> {dossier_out}")
+        print("-" * 60)
+        succes = echecs = 0
+        for idx, chemin in enumerate(fichiers, start=1):
+            print(f"[{idx}/{len(fichiers)}] {os.path.basename(chemin)}")
+            dest = os.path.join(dossier_out, os.path.basename(chemin))
+            if os.path.abspath(dest) == chemin:
+                base, ext = os.path.splitext(dest)
+                dest = f"{base}_purge{ext}"
+            if _nettoyer_pdf(chemin, dest): succes += 1
+            else: echecs += 1
+        print("-" * 60)
+        print(f"TERMINÉ : {succes} réussi(s), {echecs} échec(s).")
+        sys.exit(0 if echecs == 0 else 2)
+
+    _banniere()
     print(" PURGE UNIFIÉE DES FILIGRANES MULTI-SOURCES — macOS")
-    print("=" * 60)
+    print("-" * 60)
     if not os.path.isdir(DOSSIER_MAGAZINES):
         print(f"[ERREUR] Le dossier 'magazines' est introuvable.")
         sys.exit(1)
